@@ -191,6 +191,8 @@ typedef struct {
   UInt32 limiterWriteIndex;
 } VolumeBoostYTDSPContext;
 
+static void ApplyVolumeBoostYTDSPChain(Float32 *samples, UInt32 sampleCount, UInt32 channelCount, Float64 sampleRate, VolumeBoostYTDSPContext *state);
+
 static void RegisterRenderer(id renderer) {
   if (!activeRenderers) {
     activeRenderers = [NSHashTable weakObjectsHashTable];
