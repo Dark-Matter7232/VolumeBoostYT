@@ -1,6 +1,8 @@
 #import "YTVolumeHUD.h"
+#import <Accelerate/Accelerate.h>
 #import <AVFoundation/AVFoundation.h>
 #import <AudioToolbox/AudioToolbox.h>
+#import <MediaToolbox/MediaToolbox.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 
@@ -59,6 +61,8 @@ static NSString *const kVolumeBoostYTDefaultVolumeScalarKey =
     @"VolumeBoostYTDefaultVolumeScalar";
 static NSString *const kCustomYouTubeVolumeScalarKey =
     @"CustomYouTubeVolumeScalar";
+static const void *kVolumeBoostYTTapInstalledKey =
+    &kVolumeBoostYTTapInstalledKey;
 
 static BOOL IsVolumeBoostYTEnabled() {
   NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
@@ -76,26 +80,41 @@ static BOOL IsVolumePersistenceEnabled() {
   return [defaults boolForKey:kVolumeBoostYTPersistenceEnabledKey];
 }
 
+static float ClampVolumeMultiplier(float multiplier);
+static float GetLogarithmicAudioMultiplier(void);
+
 static float GetConfiguredDefaultVolumeMultiplier() {
   NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
   if ([defaults objectForKey:kVolumeBoostYTDefaultVolumeScalarKey] == nil) {
     return 1.0f; // Default to 100%
   }
-  float multiplier = [defaults floatForKey:kVolumeBoostYTDefaultVolumeScalarKey];
-  if (multiplier < 0.0f)
-    multiplier = 0.0f;
-  if (multiplier > 20.0f)
-    multiplier = 20.0f;
-  return multiplier;
+  return ClampVolumeMultiplier(
+      [defaults floatForKey:kVolumeBoostYTDefaultVolumeScalarKey]);
 }
 
 static NSString *FormattedVolumePercentage(float multiplier) {
   return [NSString stringWithFormat:@"%.0f%%", multiplier * 100.0f];
 }
 
+static float ClampVolumeMultiplier(float multiplier) {
+  if (multiplier < 0.0f)
+    return 0.0f;
+  if (multiplier > 20.0f)
+    return 20.0f;
+  return multiplier;
+}
+
 static float currentVolumeMultiplier = -1.0f;
 
 static NSHashTable *activeRenderers = nil;
+
+// The tap keeps just enough state to smooth gain changes across frames.
+typedef struct {
+  AudioStreamBasicDescription format;
+  Float32 envelope;
+  Float32 *scratchBuffer;
+  UInt32 scratchCapacity;
+} VolumeBoostYTTapContext;
 
 static void RegisterRenderer(id renderer) {
   if (!activeRenderers) {
@@ -104,6 +123,151 @@ static void RegisterRenderer(id renderer) {
   if (renderer) {
     [activeRenderers addObject:renderer];
   }
+}
+
+static void VolumeBoostYTTapInit(MTAudioProcessingTapRef tap, void *clientInfo,
+                                 void **tapStorageOut) {
+  (void)tap;
+  (void)clientInfo;
+  VolumeBoostYTTapContext *context =
+      calloc(1, sizeof(VolumeBoostYTTapContext));
+  context->envelope = 1.0f;
+  *tapStorageOut = context;
+}
+
+static void VolumeBoostYTTapFinalize(MTAudioProcessingTapRef tap) {
+  VolumeBoostYTTapContext *context =
+      MTAudioProcessingTapGetStorage(tap);
+  if (context) {
+    if (context->scratchBuffer) {
+      free(context->scratchBuffer);
+    }
+    free(context);
+  }
+}
+
+static void VolumeBoostYTTapPrepare(MTAudioProcessingTapRef tap,
+                                    CMItemCount maxFrames,
+                                    const AudioStreamBasicDescription *processingFormat) {
+  (void)tap;
+  VolumeBoostYTTapContext *context =
+      MTAudioProcessingTapGetStorage(tap);
+  if (context && processingFormat) {
+    context->format = *processingFormat;
+    context->envelope = 1.0f;
+    UInt32 channels = MAX((UInt32)processingFormat->mChannelsPerFrame, 1U);
+    UInt32 neededCapacity = (UInt32)maxFrames * channels;
+    if (neededCapacity > context->scratchCapacity) {
+      Float32 *newBuffer =
+          realloc(context->scratchBuffer, neededCapacity * sizeof(Float32));
+      if (newBuffer) {
+        context->scratchBuffer = newBuffer;
+        context->scratchCapacity = neededCapacity;
+      }
+    }
+  }
+}
+
+static void VolumeBoostYTTapUnprepare(MTAudioProcessingTapRef tap) {
+  (void)tap;
+}
+
+static void VolumeBoostYTTapProcess(MTAudioProcessingTapRef tap,
+                                    CMItemCount numberFrames,
+                                    MTAudioProcessingTapFlags flags,
+                                    AudioBufferList *bufferListInOut,
+                                    CMItemCount *numberFramesOut,
+                                    MTAudioProcessingTapFlags *flagsOut) {
+  (void)flags;
+  OSStatus status = MTAudioProcessingTapGetSourceAudio(
+      tap, numberFrames, bufferListInOut, flagsOut, NULL, numberFramesOut);
+  if (status != noErr || !numberFramesOut || *numberFramesOut == 0) {
+    return;
+  }
+
+  VolumeBoostYTTapContext *context =
+      MTAudioProcessingTapGetStorage(tap);
+  if (!context) {
+    return;
+  }
+
+  const AudioStreamBasicDescription *format = &context->format;
+  if (!(format->mFormatFlags & kAudioFormatFlagIsFloat) ||
+      format->mBitsPerChannel != 32) {
+    return;
+  }
+
+  Float32 targetGain = GetLogarithmicAudioMultiplier();
+  Float32 envelope = context->envelope > 0.0f ? context->envelope : 1.0f;
+  // Fast attack catches peaks quickly. Slower release avoids pumping.
+  const Float32 attack = 0.08f;
+  const Float32 release = 0.003f;
+  const Float32 drive = 1.5f;
+  const Float32 tanhNormalization = tanhf(drive);
+  Float32 peak = 0.0f;
+  UInt32 totalSampleCount = 0;
+
+  for (UInt32 bufferIndex = 0; bufferIndex < bufferListInOut->mNumberBuffers;
+       bufferIndex++) {
+    AudioBuffer buffer = bufferListInOut->mBuffers[bufferIndex];
+    Float32 *samples = (Float32 *)buffer.mData;
+    if (!samples) {
+      continue;
+    }
+
+    UInt32 sampleCount = (UInt32)(buffer.mDataByteSize / sizeof(Float32));
+    if (sampleCount == 0) {
+      continue;
+    }
+
+    Float32 bufferPeak = 0.0f;
+    vDSP_maxmgv(samples, 1, &bufferPeak, sampleCount);
+    peak = fmaxf(peak, bufferPeak);
+    totalSampleCount += sampleCount;
+  }
+
+  Float32 desiredGain = targetGain;
+  if (peak > 0.0001f) {
+    Float32 limiterGain = 0.92f / peak;
+    desiredGain = fminf(targetGain, limiterGain);
+  }
+
+  if (desiredGain < envelope) {
+    envelope += (desiredGain - envelope) * attack;
+  } else {
+    envelope += (desiredGain - envelope) * release;
+  }
+
+  if (totalSampleCount == 0 || !context->scratchBuffer) {
+    context->envelope = envelope;
+    return;
+  }
+
+  Float32 rampGain = context->envelope;
+  Float32 gainStep = (envelope - context->envelope) / totalSampleCount;
+
+  for (UInt32 bufferIndex = 0; bufferIndex < bufferListInOut->mNumberBuffers;
+       bufferIndex++) {
+    AudioBuffer buffer = bufferListInOut->mBuffers[bufferIndex];
+    Float32 *samples = (Float32 *)buffer.mData;
+    if (!samples) {
+      continue;
+    }
+
+    UInt32 sampleCount = (UInt32)(buffer.mDataByteSize / sizeof(Float32));
+    if (sampleCount == 0 || sampleCount > context->scratchCapacity) {
+      continue;
+    }
+
+    vDSP_vrampmul(samples, 1, &rampGain, &gainStep, samples, 1, sampleCount);
+    vDSP_vsmul(samples, 1, &drive, context->scratchBuffer, 1, sampleCount);
+    int sampleCountInt = (int)sampleCount;
+    vvtanhf(context->scratchBuffer, context->scratchBuffer, &sampleCountInt);
+    vDSP_vsdiv(context->scratchBuffer, 1, &tanhNormalization, samples, 1,
+               sampleCount);
+  }
+
+  context->envelope = envelope;
 }
 
 // Helper to get current volume multiplier
@@ -127,10 +291,67 @@ static float GetLogarithmicAudioMultiplier() {
   if (m <= 1.0f) {
     return m;
   }
-  // m goes from 1.0 to 20.0 in the UI (2000%).
-  // We map this linearly to an exponent to achieve 200.0x physical amplitude
-  // max. powf(200.0f, (m - 1.0f) / 19.0f) ensures m=20 gives 200^1 = 200x.
-  return powf(200.0f, (m - 1.0f) / 19.0f);
+  // This is the fallback curve for players that cannot use our sample tap.
+  // Keep it conservative so non-tap playback still sounds reasonably smooth.
+  static const float kMaxSafeAudioGain = 4.0f;
+  float normalized = (m - 1.0f) / 19.0f;
+  float eased = 1.0f - powf(1.0f - normalized, 2.0f);
+  return 1.0f + eased * (kMaxSafeAudioGain - 1.0f);
+}
+
+static BOOL HasVolumeBoostYTTap(id playerItem) {
+  return [objc_getAssociatedObject(playerItem, kVolumeBoostYTTapInstalledKey)
+      boolValue];
+}
+
+static void InstallVolumeBoostYTTapOnPlayerItem(AVPlayerItem *playerItem) {
+  if (!playerItem || HasVolumeBoostYTTap(playerItem)) {
+    return;
+  }
+
+  // Some streaming paths expose the player item before audio tracks are ready.
+  // In that case we leave it unmarked and retry later from AVPlayer hooks.
+  AVAsset *asset = playerItem.asset;
+  NSArray<AVAssetTrack *> *audioTracks =
+      [asset tracksWithMediaType:AVMediaTypeAudio];
+  if (audioTracks.count == 0) {
+    return;
+  }
+
+  MTAudioProcessingTapCallbacks callbacks;
+  callbacks.version = kMTAudioProcessingTapCallbacksVersion_0;
+  callbacks.clientInfo = NULL;
+  callbacks.init = VolumeBoostYTTapInit;
+  callbacks.finalize = VolumeBoostYTTapFinalize;
+  callbacks.prepare = VolumeBoostYTTapPrepare;
+  callbacks.unprepare = VolumeBoostYTTapUnprepare;
+  callbacks.process = VolumeBoostYTTapProcess;
+
+  AVMutableAudioMix *audioMix = [AVMutableAudioMix audioMix];
+  NSMutableArray *inputParameters = [NSMutableArray array];
+
+  for (AVAssetTrack *track in audioTracks) {
+    AVMutableAudioMixInputParameters *params =
+        [AVMutableAudioMixInputParameters audioMixInputParametersWithTrack:track];
+    MTAudioProcessingTapRef tap = NULL;
+    OSStatus status = MTAudioProcessingTapCreate(
+        kCFAllocatorDefault, &callbacks, kMTAudioProcessingTapCreationFlag_PostEffects,
+        &tap);
+    if (status == noErr && tap) {
+      params.audioTapProcessor = tap;
+      CFRelease(tap);
+      [inputParameters addObject:params];
+    }
+  }
+
+  if (inputParameters.count == 0) {
+    return;
+  }
+
+  audioMix.inputParameters = inputParameters;
+  playerItem.audioMix = audioMix;
+  objc_setAssociatedObject(playerItem, kVolumeBoostYTTapInstalledKey, @YES,
+                           OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
 static void NotifyVolumeChange() {
@@ -144,10 +365,7 @@ static void NotifyVolumeChange() {
 }
 
 static void SetCustomVolumeMultiplier(float multiplier) {
-  if (multiplier < 0.0f)
-    multiplier = 0.0f;
-  if (multiplier > 20.0f)
-    multiplier = 20.0f;
+  multiplier = ClampVolumeMultiplier(multiplier);
 
   if (IsVolumePersistenceEnabled()) {
     [[NSUserDefaults standardUserDefaults]
@@ -162,10 +380,7 @@ static void SetCustomVolumeMultiplier(float multiplier) {
 }
 
 static void SetConfiguredDefaultVolumeMultiplier(float multiplier) {
-  if (multiplier < 0.0f)
-    multiplier = 0.0f;
-  if (multiplier > 20.0f)
-    multiplier = 20.0f;
+  multiplier = ClampVolumeMultiplier(multiplier);
 
   NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
   [defaults setFloat:multiplier forKey:kVolumeBoostYTDefaultVolumeScalarKey];
@@ -198,12 +413,42 @@ static UIViewController *TopViewController(UIViewController *viewController) {
   RegisterRenderer(orig);
   return orig;
 }
+- (instancetype)initWithPlayerItem:(AVPlayerItem *)item {
+  InstallVolumeBoostYTTapOnPlayerItem(item);
+  id orig = %orig(item);
+  RegisterRenderer(orig);
+  return orig;
+}
+- (void)replaceCurrentItemWithPlayerItem:(AVPlayerItem *)item {
+  InstallVolumeBoostYTTapOnPlayerItem(item);
+  %orig(item);
+}
 - (void)setVolume:(float)volume {
   RegisterRenderer(self);
-  if (IsVolumeBoostYTEnabled()) {
+  AVPlayerItem *currentItem = [self currentItem];
+  if (IsVolumeBoostYTEnabled() && currentItem &&
+      !HasVolumeBoostYTTap(currentItem)) {
+    InstallVolumeBoostYTTapOnPlayerItem(currentItem);
+  }
+  if (IsVolumeBoostYTEnabled() &&
+      !HasVolumeBoostYTTap(currentItem)) {
     volume = volume * GetLogarithmicAudioMultiplier();
   }
   %orig(volume);
+}
+%end
+
+%hook AVPlayerItem
+- (instancetype)initWithAsset:(AVAsset *)asset {
+  id orig = %orig(asset);
+  InstallVolumeBoostYTTapOnPlayerItem(orig);
+  return orig;
+}
+- (instancetype)initWithAsset:(AVAsset *)asset
+    automaticallyLoadedAssetKeys:(NSArray<NSString *> *)keys {
+  id orig = %orig(asset, keys);
+  InstallVolumeBoostYTTapOnPlayerItem(orig);
+  return orig;
 }
 %end
 
@@ -332,11 +577,7 @@ static CGPoint initialTouchPoint;
       // A full 570-point swipe upward reaches the 20x multiplier
       float deltaMultiplier = -translationY / 30.0f;
       float newMultiplier = gestureStartMultiplier + deltaMultiplier;
-
-      if (newMultiplier < 0.0f)
-        newMultiplier = 0.0f;
-      if (newMultiplier > 20.0f)
-        newMultiplier = 20.0f;
+      newMultiplier = ClampVolumeMultiplier(newMultiplier);
 
       SetCustomVolumeMultiplier(newMultiplier);
       [[YTVolumeHUD sharedHUD] showWithValue:newMultiplier];
