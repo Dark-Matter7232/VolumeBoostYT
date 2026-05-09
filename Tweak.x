@@ -370,31 +370,29 @@ static CGPoint initialTouchPoint;
 
         %hook YTSettingsGroupData
 
-    - (NSArray<NSNumber *> *)orderedCategories {
+- (NSArray<NSNumber *> *)orderedCategories {
   // Only inject into the main settings group (type 1)
   if (self.type != 1)
     return %orig;
 
   // If another tweak (YouGroupSettings) handles grouping, let it do so
-  if (class_getClassMethod(objc_getClass("YTSettingsGroupData"),
-                           @selector(tweaks))) {
-    return %orig;
+  Class settingsGroupDataClass = objc_getClass("YTSettingsGroupData");
+  if (class_getClassMethod(settingsGroupDataClass, @selector(tweaks)) &&
+      [settingsGroupDataClass respondsToSelector:@selector(tweaks)]) {
+    NSArray<NSNumber *> *tweaks =
+        [settingsGroupDataClass performSelector:@selector(tweaks)];
+    if ([tweaks containsObject:@(TweakSection)]) {
+      return %orig;
+    }
   }
 
   NSMutableArray *mutableCategories = %orig.mutableCopy;
-  if (mutableCategories) {
+  if (mutableCategories &&
+      ![mutableCategories containsObject:@(TweakSection)]) {
     // Insert our tweak section near the top
     [mutableCategories insertObject:@(TweakSection) atIndex:0];
   }
   return mutableCategories.copy ?: %orig;
-}
-
-+ (NSMutableArray<NSNumber *> *)tweaks {
-  NSMutableArray<NSNumber *> *tweaks = %orig;
-  if (tweaks && ![tweaks containsObject:@(TweakSection)]) {
-    [tweaks addObject:@(TweakSection)];
-  }
-  return tweaks;
 }
 
 %end
@@ -591,19 +589,37 @@ static CGPoint initialTouchPoint;
 
     %end // end group YouTubeSettings
 
-    %ctor {
+static BOOL IsYouTubeProcess() {
+  return NSClassFromString(@"YTSettingsGroupData") != nil ||
+         NSClassFromString(@"YTPlayerViewController") != nil;
+}
+
+static BOOL HasYouTubeSettingsClasses() {
+  return NSClassFromString(@"YTSettingsGroupData") != nil &&
+         NSClassFromString(@"YTAppSettingsPresentationData") != nil &&
+         NSClassFromString(@"YTSettingsSectionItemManager") != nil &&
+         NSClassFromString(@"YTSettingsSectionItem") != nil;
+}
+
+%ctor {
   // Never inject into SpringBoard (Home Screen)
   NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier];
   if ([bundleID isEqualToString:@"com.apple.springboard"]) {
     return;
   }
 
-  // Check if YouTube classes exist instead of relying on Bundle ID,
-  // because sideloaded apps (like LiveContainer) often change their Bundle IDs.
-  if (NSClassFromString(@"YTSettingsGroupData")) {
+  // Only initialize inside a YouTube process. Sideloaded builds may use
+  // different bundle identifiers, so class presence is safer than bundle ID.
+  if (!IsYouTubeProcess()) {
+    return;
+  }
+
+  // Settings integration is optional and should only load when the full set of
+  // expected YouTube settings classes is available.
+  if (HasYouTubeSettingsClasses()) {
     %init(YouTubeSettings);
   }
 
-  // Always initialize the core AVPlayer and UIWindow touch hooks for every app
+  // Core player and gesture hooks are only intended for YouTube itself.
   %init;
 }
