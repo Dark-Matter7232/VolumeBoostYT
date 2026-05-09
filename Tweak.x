@@ -7,6 +7,7 @@
 #import <math.h>
 #import <string.h>
 #import <objc/runtime.h>
+#import <stdatomic.h>
 
 // YouTube Settings Headers
 @interface YTSettingsCell : UITableViewCell
@@ -188,7 +189,7 @@ typedef struct {
   UInt32 limiterDelayCapacity;
   UInt32 limiterDelaySamples;
   UInt32 limiterWriteIndex;
-} VolumeBoostYTTapContext;
+} VolumeBoostYTDSPContext;
 
 static void RegisterRenderer(id renderer) {
   if (!activeRenderers) {
@@ -203,14 +204,14 @@ static void VolumeBoostYTTapInit(MTAudioProcessingTapRef tap, void *clientInfo,
                                  void **tapStorageOut) {
   (void)tap;
   (void)clientInfo;
-  VolumeBoostYTTapContext *context =
-      calloc(1, sizeof(VolumeBoostYTTapContext));
+  VolumeBoostYTDSPContext *context =
+      calloc(1, sizeof(VolumeBoostYTDSPContext));
   context->envelope = 1.0f;
   *tapStorageOut = context;
 }
 
 static void VolumeBoostYTTapFinalize(MTAudioProcessingTapRef tap) {
-  VolumeBoostYTTapContext *context =
+  VolumeBoostYTDSPContext *context =
       MTAudioProcessingTapGetStorage(tap);
   if (context) {
     if (context->limiterDelayBuffer) {
@@ -235,7 +236,7 @@ static void VolumeBoostYTTapFinalize(MTAudioProcessingTapRef tap) {
   }
 }
 
-static void EnsureBassStateCapacity(VolumeBoostYTTapContext *context,
+static void EnsureBassStateCapacity(VolumeBoostYTDSPContext *context,
                                     UInt32 channelCount) {
   if (!context || channelCount == 0 ||
       channelCount <= context->bassStateChannelCount) {
@@ -257,7 +258,7 @@ static void EnsureBassStateCapacity(VolumeBoostYTTapContext *context,
   context->bassStateChannelCount = channelCount;
 }
 
-static void EnsureCompressorStateCapacity(VolumeBoostYTTapContext *context,
+static void EnsureCompressorStateCapacity(VolumeBoostYTDSPContext *context,
                                           UInt32 channelCount) {
   if (!context || channelCount == 0 ||
       channelCount <= context->compressorStateChannelCount) {
@@ -279,7 +280,7 @@ static void EnsureCompressorStateCapacity(VolumeBoostYTTapContext *context,
   context->compressorStateChannelCount = channelCount;
 }
 
-static void EnsurePresenceStateCapacity(VolumeBoostYTTapContext *context,
+static void EnsurePresenceStateCapacity(VolumeBoostYTDSPContext *context,
                                         UInt32 channelCount) {
   if (!context || channelCount == 0 ||
       channelCount <= context->presenceStateChannelCount) {
@@ -301,7 +302,7 @@ static void EnsurePresenceStateCapacity(VolumeBoostYTTapContext *context,
   context->presenceStateChannelCount = channelCount;
 }
 
-static void EnsureLimiterStateCapacity(VolumeBoostYTTapContext *context,
+static void EnsureLimiterStateCapacity(VolumeBoostYTDSPContext *context,
                                        UInt32 channelCount,
                                        UInt32 delaySamples) {
   if (!context || channelCount == 0 || delaySamples == 0) {
@@ -472,7 +473,7 @@ static void ApplyPresenceEnhancement(Float32 *samples, UInt32 sampleCount,
 static void ApplyLookaheadLimiter(Float32 *samples, UInt32 sampleCount,
                                   UInt32 channelCount,
                                   UInt32 channelOffset,
-                                  VolumeBoostYTTapContext *context) {
+                                  VolumeBoostYTDSPContext *context) {
   if (!samples || sampleCount == 0 || channelCount == 0 || !context ||
       !context->limiterEnvelopeState || !context->limiterDelayBuffer ||
       context->limiterDelaySamples == 0) {
@@ -525,11 +526,14 @@ static void ApplyLookaheadLimiter(Float32 *samples, UInt32 sampleCount,
   context->limiterWriteIndex = writeIndex;
 }
 
+
+
+
 static void VolumeBoostYTTapPrepare(MTAudioProcessingTapRef tap,
                                     CMItemCount maxFrames,
                                     const AudioStreamBasicDescription *processingFormat) {
   (void)tap;
-  VolumeBoostYTTapContext *context =
+  VolumeBoostYTDSPContext *context =
       MTAudioProcessingTapGetStorage(tap);
   if (context && processingFormat) {
     context->format = *processingFormat;
@@ -570,7 +574,7 @@ static void VolumeBoostYTTapProcess(MTAudioProcessingTapRef tap,
     return;
   }
 
-  VolumeBoostYTTapContext *context =
+  VolumeBoostYTDSPContext *context =
       MTAudioProcessingTapGetStorage(tap);
   if (!context) {
     return;
@@ -582,110 +586,101 @@ static void VolumeBoostYTTapProcess(MTAudioProcessingTapRef tap,
     return;
   }
 
-  Float32 targetGain = GetLogarithmicAudioMultiplier();
-  Float32 envelope = context->envelope > 0.0f ? context->envelope : 1.0f;
-  // Fast attack catches peaks quickly. Slower release avoids pumping.
-  const Float32 attack = 0.08f;
-  const Float32 release = 0.003f;
-  const Float32 drive = 1.5f;
-  const Float32 tanhNormalization = tanhf(drive);
   const BOOL isNonInterleaved =
       (format->mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0;
-  Float32 peak = 0.0f;
+  
   UInt32 totalSampleCount = 0;
-
-  for (UInt32 bufferIndex = 0; bufferIndex < bufferListInOut->mNumberBuffers;
-       bufferIndex++) {
-    AudioBuffer buffer = bufferListInOut->mBuffers[bufferIndex];
-    Float32 *samples = (Float32 *)buffer.mData;
-    if (!samples) {
-      continue;
-    }
-
-    UInt32 sampleCount = (UInt32)(buffer.mDataByteSize / sizeof(Float32));
-    if (sampleCount == 0) {
-      continue;
-    }
-
-    Float32 bufferPeak = 0.0f;
-    vDSP_maxmgv(samples, 1, &bufferPeak, sampleCount);
-    peak = fmaxf(peak, bufferPeak);
+  for (UInt32 bufferIndex = 0; bufferIndex < bufferListInOut->mNumberBuffers; bufferIndex++) {
+    UInt32 sampleCount = (UInt32)(bufferListInOut->mBuffers[bufferIndex].mDataByteSize / sizeof(Float32));
     totalSampleCount += sampleCount;
   }
-
-  Float32 desiredGain = targetGain;
-  if (peak > 0.0001f) {
-    Float32 limiterGain = 0.92f / peak;
-    desiredGain = fminf(targetGain, limiterGain);
-  }
-
-  if (desiredGain < envelope) {
-    envelope += (desiredGain - envelope) * attack;
-  } else {
-    envelope += (desiredGain - envelope) * release;
-  }
-
-  if (totalSampleCount == 0 || !context->scratchBuffer) {
-    context->envelope = envelope;
+  if (totalSampleCount == 0) {
     return;
   }
 
-  Float32 rampGain = context->envelope;
-  Float32 gainStep = (envelope - context->envelope) / totalSampleCount;
   UInt32 channelCursor = 0;
 
   for (UInt32 bufferIndex = 0; bufferIndex < bufferListInOut->mNumberBuffers;
        bufferIndex++) {
     AudioBuffer buffer = bufferListInOut->mBuffers[bufferIndex];
     Float32 *samples = (Float32 *)buffer.mData;
-    if (!samples) {
-      continue;
-    }
+    if (!samples) continue;
 
     UInt32 sampleCount = (UInt32)(buffer.mDataByteSize / sizeof(Float32));
-    if (sampleCount == 0 || sampleCount > context->scratchCapacity) {
-      continue;
-    }
+    if (sampleCount == 0) continue;
 
-    vDSP_vrampmul(samples, 1, &rampGain, &gainStep, samples, 1, sampleCount);
-    UInt32 bufferChannelCount = MAX(buffer.mNumberChannels, 1U);
+    UInt32 bufferChannelCount = MAX((UInt32)buffer.mNumberChannels, 1U);
     if (!isNonInterleaved) {
       bufferChannelCount = MAX((UInt32)format->mChannelsPerFrame, 1U);
     }
-    EnsureBassStateCapacity(context, channelCursor + bufferChannelCount);
-    EnsureCompressorStateCapacity(context, channelCursor + bufferChannelCount);
-    EnsurePresenceStateCapacity(context, channelCursor + bufferChannelCount);
-    if (context->bassState && channelCursor + bufferChannelCount <=
-                                  context->bassStateChannelCount) {
-      ApplyBassEnhancement(samples, sampleCount, bufferChannelCount,
-                           format->mSampleRate,
-                           context->bassState + channelCursor);
+    
+    if (isNonInterleaved && bufferListInOut->mNumberBuffers > 1) {
+      // Inline the original DSP chain with channelCursor offset
+      Float32 targetGain = GetLogarithmicAudioMultiplier();
+      Float32 envelope = context->envelope > 0.0f ? context->envelope : 1.0f;
+      const Float32 attack = 0.08f;
+      const Float32 release = 0.003f;
+      Float32 peak = 0.0f;
+      vDSP_maxmgv(samples, 1, &peak, sampleCount);
+      
+      Float32 desiredGain = targetGain;
+      if (peak > 0.0001f) {
+        Float32 limiterGain = 0.92f / peak;
+        desiredGain = fminf(targetGain, limiterGain);
+      }
+      
+      if (desiredGain < envelope) {
+        envelope += (desiredGain - envelope) * attack;
+      } else {
+        envelope += (desiredGain - envelope) * release;
+      }
+      
+      Float32 rampGain = context->envelope;
+      Float32 gainStep = (envelope - context->envelope) / sampleCount;
+      const Float32 drive = 1.5f;
+      const Float32 tanhNormalization = tanhf(drive);
+      
+      vDSP_vrampmul(samples, 1, &rampGain, &gainStep, samples, 1, sampleCount);
+      
+      EnsureBassStateCapacity(context, bufferChannelCount);
+      EnsureCompressorStateCapacity(context, bufferChannelCount);
+      EnsurePresenceStateCapacity(context, bufferChannelCount);
+      UInt32 lookaheadSamples = (UInt32)fmin(fmax(format->mSampleRate * 0.003, 32.0), 256.0);
+      EnsureLimiterStateCapacity(context, bufferChannelCount, lookaheadSamples);
+      
+      if (context->bassState && bufferChannelCount <= context->bassStateChannelCount) {
+        ApplyBassEnhancement(samples, sampleCount, bufferChannelCount, format->mSampleRate, context->bassState + channelCursor);
+      }
+      if (context->compressorState && bufferChannelCount <= context->compressorStateChannelCount) {
+        ApplyLoudnessCompressor(samples, sampleCount, bufferChannelCount, format->mSampleRate, context->compressorState + channelCursor);
+      }
+      if (context->presenceState && bufferChannelCount <= context->presenceStateChannelCount) {
+        ApplyPresenceEnhancement(samples, sampleCount, bufferChannelCount, format->mSampleRate, context->presenceState + channelCursor);
+      }
+      
+      ApplyLookaheadLimiter(samples, sampleCount, bufferChannelCount, channelCursor, context);
+      
+      UInt32 neededCapacity = sampleCount;
+      if (neededCapacity > context->scratchCapacity) {
+        Float32 *newBuf = realloc(context->scratchBuffer, neededCapacity * sizeof(Float32));
+        if (newBuf) {
+          context->scratchBuffer = newBuf;
+          context->scratchCapacity = neededCapacity;
+        }
+      }
+      if (context->scratchBuffer) {
+        vDSP_vsmul(samples, 1, &drive, context->scratchBuffer, 1, sampleCount);
+        int sampleCountInt = (int)sampleCount;
+        vvtanhf(context->scratchBuffer, context->scratchBuffer, &sampleCountInt);
+        vDSP_vsdiv(context->scratchBuffer, 1, &tanhNormalization, samples, 1, sampleCount);
+      }
+      context->envelope = envelope;
+    } else {
+      ApplyVolumeBoostYTDSPChain(samples, sampleCount, bufferChannelCount, format->mSampleRate, context);
     }
-    if (context->compressorState &&
-        channelCursor + bufferChannelCount <=
-            context->compressorStateChannelCount) {
-      ApplyLoudnessCompressor(samples, sampleCount, bufferChannelCount,
-                              format->mSampleRate,
-                              context->compressorState + channelCursor);
-    }
-    if (context->presenceState &&
-        channelCursor + bufferChannelCount <=
-            context->presenceStateChannelCount) {
-      ApplyPresenceEnhancement(samples, sampleCount, bufferChannelCount,
-                               format->mSampleRate,
-                               context->presenceState + channelCursor);
-    }
-    ApplyLookaheadLimiter(samples, sampleCount, bufferChannelCount,
-                          channelCursor, context);
-    vDSP_vsmul(samples, 1, &drive, context->scratchBuffer, 1, sampleCount);
-    int sampleCountInt = (int)sampleCount;
-    vvtanhf(context->scratchBuffer, context->scratchBuffer, &sampleCountInt);
-    vDSP_vsdiv(context->scratchBuffer, 1, &tanhNormalization, samples, 1,
-               sampleCount);
+    
     channelCursor += bufferChannelCount;
   }
-
-  context->envelope = envelope;
 }
 
 // Helper to get current volume multiplier
@@ -846,8 +841,11 @@ static UIViewController *TopViewController(UIViewController *viewController) {
       !HasVolumeBoostYTTap(currentItem)) {
     InstallVolumeBoostYTTapOnPlayerItem(currentItem);
   }
-  if (IsVolumeBoostYTEnabled()) {
+  
+  if (IsVolumeBoostYTEnabled() && currentItem && HasVolumeBoostYTTap(currentItem)) {
     volume = 1.0f;
+  } else if (IsVolumeBoostYTEnabled() && IsFallbackBoostEnabled()) {
+    volume *= GetLogarithmicAudioMultiplier();
   }
   %orig(volume);
 }
@@ -902,20 +900,7 @@ static UIViewController *TopViewController(UIViewController *viewController) {
 }
 %end
 
-%hook AVSampleBufferAudioRenderer
-- (instancetype)init {
-  id orig = %orig;
-  RegisterRenderer(orig);
-  return orig;
-}
-- (void)setVolume:(float)volume {
-  RegisterRenderer(self);
-  if (IsVolumeBoostYTEnabled() && IsFallbackBoostEnabled()) {
-    volume = volume * GetLogarithmicAudioMultiplier();
-  }
-  %orig(volume);
-}
-%end
+
 
     // -----------------------------------------------------
     // UI Hooks for Configuration (Native Touch Tracking via sendEvent:)
@@ -925,6 +910,307 @@ static UIViewController *TopViewController(UIViewController *viewController) {
 static BOOL possibleVolumeGesture = NO;
 static BOOL isTrackingVolumeGesture = NO;
 static CGPoint initialTouchPoint;
+
+
+// Flag to track DSP initialization for fallback logic
+
+@interface VolumeBoostYTRendererState : NSObject {
+@public
+  VolumeBoostYTDSPContext *_state;
+  atomic_bool _dspActive;
+  atomic_bool _hasLogged;
+}
+@end
+
+@implementation VolumeBoostYTRendererState
+- (instancetype)init {
+  self = [super init];
+  if (self) {
+    _state = calloc(1, sizeof(VolumeBoostYTDSPContext));
+    if (_state) {
+      _state->envelope = 1.0f;
+    }
+    atomic_init(&_dspActive, false);
+    atomic_init(&_hasLogged, false);
+  }
+  return self;
+}
+
+- (void)dealloc {
+  if (_state) {
+    if (_state->limiterDelayBuffer) free(_state->limiterDelayBuffer);
+    if (_state->limiterEnvelopeState) free(_state->limiterEnvelopeState);
+    if (_state->presenceState) free(_state->presenceState);
+    if (_state->compressorState) free(_state->compressorState);
+    if (_state->bassState) free(_state->bassState);
+    if (_state->scratchBuffer) free(_state->scratchBuffer);
+    free(_state);
+  }
+}
+@end
+
+static void ResetVolumeBoostYTDSPState(VolumeBoostYTDSPContext *context) {
+  if (!context) return;
+  context->envelope = 1.0f;
+  if (context->bassState) {
+    memset(context->bassState, 0, context->bassStateChannelCount * sizeof(Float32));
+  }
+  if (context->compressorState) {
+    memset(context->compressorState, 0, context->compressorStateChannelCount * sizeof(Float32));
+  }
+  if (context->presenceState) {
+    memset(context->presenceState, 0, context->presenceStateChannelCount * sizeof(Float32));
+  }
+  if (context->limiterDelayBuffer) {
+    memset(context->limiterDelayBuffer, 0, context->limiterDelayCapacity * sizeof(Float32));
+  }
+  if (context->limiterEnvelopeState) {
+    for (UInt32 i = 0; i < context->limiterEnvelopeChannelCount; ++i) {
+      context->limiterEnvelopeState[i] = 1.0f;
+    }
+  }
+  context->limiterWriteIndex = 0;
+}
+
+static void ApplyVolumeBoostYTDSPChain(Float32 *samples, UInt32 sampleCount, UInt32 channelCount, Float64 sampleRate, VolumeBoostYTDSPContext *state) {
+  if (!samples || sampleCount == 0 || channelCount == 0 || !state) return;
+  
+  Float32 targetGain = GetLogarithmicAudioMultiplier();
+  Float32 envelope = state->envelope > 0.0f ? state->envelope : 1.0f;
+  const Float32 attack = 0.08f;
+  const Float32 release = 0.003f;
+  
+  Float32 peak = 0.0f;
+  vDSP_maxmgv(samples, 1, &peak, sampleCount);
+  
+  Float32 desiredGain = targetGain;
+  if (peak > 0.0001f) {
+    Float32 limiterGain = 0.92f / peak;
+    desiredGain = fminf(targetGain, limiterGain);
+  }
+  
+  if (desiredGain < envelope) {
+    envelope += (desiredGain - envelope) * attack;
+  } else {
+    envelope += (desiredGain - envelope) * release;
+  }
+  
+  Float32 rampGain = state->envelope;
+  Float32 gainStep = (envelope - state->envelope) / sampleCount;
+  const Float32 drive = 1.5f;
+  const Float32 tanhNormalization = tanhf(drive);
+  
+  vDSP_vrampmul(samples, 1, &rampGain, &gainStep, samples, 1, sampleCount);
+  
+  EnsureBassStateCapacity(state, channelCount);
+  EnsureCompressorStateCapacity(state, channelCount);
+  EnsurePresenceStateCapacity(state, channelCount);
+  UInt32 lookaheadSamples = (UInt32)fmin(fmax(sampleRate * 0.003, 32.0), 256.0);
+  EnsureLimiterStateCapacity(state, channelCount, lookaheadSamples);
+  
+  if (state->bassState && channelCount <= state->bassStateChannelCount) {
+    ApplyBassEnhancement(samples, sampleCount, channelCount, sampleRate, state->bassState);
+  }
+  if (state->compressorState && channelCount <= state->compressorStateChannelCount) {
+    ApplyLoudnessCompressor(samples, sampleCount, channelCount, sampleRate, state->compressorState);
+  }
+  if (state->presenceState && channelCount <= state->presenceStateChannelCount) {
+    ApplyPresenceEnhancement(samples, sampleCount, channelCount, sampleRate, state->presenceState);
+  }
+  
+  ApplyLookaheadLimiter(samples, sampleCount, channelCount, 0, state);
+  
+  UInt32 neededCapacity = sampleCount;
+  if (neededCapacity > state->scratchCapacity) {
+    Float32 *newBuf = realloc(state->scratchBuffer, neededCapacity * sizeof(Float32));
+    if (newBuf) {
+      state->scratchBuffer = newBuf;
+      state->scratchCapacity = neededCapacity;
+    }
+  }
+  
+  if (state->scratchBuffer) {
+    vDSP_vsmul(samples, 1, &drive, state->scratchBuffer, 1, sampleCount);
+    int sampleCountInt = (int)sampleCount;
+    vvtanhf(state->scratchBuffer, state->scratchBuffer, &sampleCountInt);
+    vDSP_vsdiv(state->scratchBuffer, 1, &tanhNormalization, samples, 1, sampleCount);
+  }
+  
+  state->envelope = envelope;
+}
+
+static const void *kVolumeBoostYTRendererContextKey = &kVolumeBoostYTRendererContextKey;
+
+%hook AVSampleBufferAudioRenderer
+- (instancetype)init {
+  id orig = %orig;
+  RegisterRenderer(orig);
+  return orig;
+}
+
+- (void)setVolume:(float)volume {
+  RegisterRenderer(self);
+  VolumeBoostYTRendererState *wrapper = objc_getAssociatedObject(self, kVolumeBoostYTRendererContextKey);
+  BOOL isActive = wrapper ? atomic_load(&wrapper->_dspActive) : NO;
+  
+  if (IsVolumeBoostYTEnabled() && isActive) {
+    volume = 1.0f;
+  } else if (IsVolumeBoostYTEnabled() && IsFallbackBoostEnabled()) {
+    volume *= GetLogarithmicAudioMultiplier();
+  }
+  
+  %orig(volume);
+}
+
+- (void)enqueueSampleBuffer:(CMSampleBufferRef)sampleBuffer {
+  if (!sampleBuffer || !IsVolumeBoostYTEnabled() || !IsFallbackBoostEnabled()) {
+    %orig(sampleBuffer);
+    return;
+  }
+  
+  CMFormatDescriptionRef formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer);
+  if (!formatDesc) {
+    %orig(sampleBuffer);
+    return;
+  }
+  
+  const AudioStreamBasicDescription *asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc);
+  if (!asbd || asbd->mFormatID != kAudioFormatLinearPCM) {
+    %orig(sampleBuffer);
+    return;
+  }
+  
+  if (asbd->mBytesPerFrame == 0 || asbd->mChannelsPerFrame == 0) {
+    %orig(sampleBuffer);
+    return;
+  }
+  
+  if (asbd->mFormatFlags & kAudioFormatFlagIsNonInterleaved) {
+    %orig(sampleBuffer);
+    return;
+  }
+  
+  BOOL isInt16 = (asbd->mBitsPerChannel == 16 && (asbd->mFormatFlags & kAudioFormatFlagIsSignedInteger));
+  BOOL isFloat = (asbd->mBitsPerChannel == 32 && (asbd->mFormatFlags & kAudioFormatFlagIsFloat));
+  if (!isInt16 && !isFloat) {
+    %orig(sampleBuffer);
+    return;
+  }
+  
+  VolumeBoostYTRendererState *wrapper = objc_getAssociatedObject(self, kVolumeBoostYTRendererContextKey);
+  if (!wrapper) {
+    wrapper = [[VolumeBoostYTRendererState alloc] init];
+    wrapper->_state->format = *asbd;
+    objc_setAssociatedObject(self, kVolumeBoostYTRendererContextKey, wrapper, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+  } else if (wrapper->_state->format.mSampleRate != asbd->mSampleRate || wrapper->_state->format.mChannelsPerFrame != asbd->mChannelsPerFrame) {
+    ResetVolumeBoostYTDSPState(wrapper->_state);
+    wrapper->_state->format = *asbd;
+  }
+  
+  CMBlockBufferRef blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer);
+  if (!blockBuffer) {
+    %orig(sampleBuffer);
+    return;
+  }
+  
+  size_t length = CMBlockBufferGetDataLength(blockBuffer);
+  if (length == 0) {
+    %orig(sampleBuffer);
+    return;
+  }
+  
+  CMBlockBufferRef contiguousBuffer = NULL;
+  OSStatus status = CMBlockBufferCreateContiguous(kCFAllocatorDefault, blockBuffer, kCFAllocatorDefault, NULL, 0, length, kCMBlockBufferAlwaysCopyDataFlag, &contiguousBuffer);
+  if (status != noErr || !contiguousBuffer) {
+    %orig(sampleBuffer);
+    return;
+  }
+  
+  char *dataPtr = NULL;
+  status = CMBlockBufferGetDataPointer(contiguousBuffer, 0, NULL, &length, &dataPtr);
+  if (status != noErr || !dataPtr || length == 0) {
+    CFRelease(contiguousBuffer);
+    %orig(sampleBuffer);
+    return;
+  }
+  
+  char *outBuf = malloc(length);
+  if (!outBuf) {
+    CFRelease(contiguousBuffer);
+    %orig(sampleBuffer);
+    return;
+  }
+  
+  UInt32 frames = (UInt32)(length / asbd->mBytesPerFrame);
+  UInt32 channels = asbd->mChannelsPerFrame;
+  UInt32 totalSamples = frames * channels;
+  
+  Float32 *processBuffer = NULL;
+  
+  if (isInt16) {
+    processBuffer = malloc(totalSamples * sizeof(Float32));
+    if (!processBuffer) {
+      free(outBuf);
+      CFRelease(contiguousBuffer);
+      %orig(sampleBuffer);
+      return;
+    }
+    float scale = 1.0f / 32768.0f;
+    vDSP_vflt16((SInt16 *)dataPtr, 1, processBuffer, 1, totalSamples);
+    vDSP_vsmul(processBuffer, 1, &scale, processBuffer, 1, totalSamples);
+  } else {
+    processBuffer = (Float32 *)outBuf; // operate in place on our copied buffer
+    memcpy(outBuf, dataPtr, length);
+  }
+  
+  ApplyVolumeBoostYTDSPChain(processBuffer, totalSamples, channels, asbd->mSampleRate, wrapper->_state);
+  
+  if (isInt16) {
+    float scale = 32768.0f;
+    float maxVal = 32767.0f;
+    float minVal = -32768.0f;
+    vDSP_vsmul(processBuffer, 1, &scale, processBuffer, 1, totalSamples);
+    vDSP_vclip(processBuffer, 1, &minVal, &maxVal, processBuffer, 1, totalSamples);
+    vDSP_vfix16(processBuffer, 1, (SInt16 *)outBuf, 1, totalSamples);
+    free(processBuffer);
+  }
+  
+  CMBlockBufferRef newBlockBuffer = NULL;
+  status = CMBlockBufferCreateWithMemoryBlock(kCFAllocatorDefault, outBuf, length, kCFAllocatorMalloc, NULL, 0, length, 0, &newBlockBuffer);
+  if (status != noErr || !newBlockBuffer) {
+    free(outBuf);
+    CFRelease(contiguousBuffer);
+    %orig(sampleBuffer);
+    return;
+  }
+  
+  CMSampleBufferRef newSampleBuffer = NULL;
+  status = CMSampleBufferCreateCopyWithNewTiming(kCFAllocatorDefault, sampleBuffer, 0, NULL, &newSampleBuffer);
+  if (status == noErr && newSampleBuffer) {
+    status = CMSampleBufferSetDataBuffer(newSampleBuffer, newBlockBuffer);
+    if (status == noErr) {
+      atomic_store(&wrapper->_dspActive, true);
+      
+      bool expected = false;
+      if (atomic_compare_exchange_strong(&wrapper->_hasLogged, &expected, true)) {
+        NSLog(@"[VolumeBoostYT] AVSampleBufferAudioRenderer DSP active: %u channels, %f Hz, %u bits", (unsigned int)asbd->mChannelsPerFrame, asbd->mSampleRate, (unsigned int)asbd->mBitsPerChannel);
+      }
+      
+      %orig(newSampleBuffer);
+      CFRelease(newSampleBuffer);
+    } else {
+      CFRelease(newSampleBuffer);
+      %orig(sampleBuffer);
+    }
+  } else {
+    %orig(sampleBuffer);
+  }
+  
+  CFRelease(newBlockBuffer);
+  CFRelease(contiguousBuffer);
+}
+%end
+
 
 %hook UIWindow
 - (void)sendEvent:(UIEvent *)event {
@@ -1139,7 +1425,7 @@ static CGPoint initialTouchPoint;
   YTSettingsSectionItem *fallbackBoost = [YTSettingsSectionItemClass
           switchItemWithTitle:@"Fallback boost"
              titleDescription:
-                 @"Keep emergency volume scaling enabled for non-AVPlayer playback paths"
+                 @"Apply DSP boost chain to YouTube's primary playback engine"
       accessibilityIdentifier:nil
                      switchOn:IsFallbackBoostEnabled()
                   switchBlock:^BOOL(YTSettingsCell *cell, BOOL enabled) {
