@@ -16,6 +16,12 @@
                         switchBlock:(BOOL (^)(YTSettingsCell *cell,
                                               BOOL enabled))switchBlock
                       settingItemId:(int)settingItemId;
++ (instancetype)itemWithTitle:(NSString *)title
+             titleDescription:(NSString *)titleDescription
+      accessibilityIdentifier:(NSString *)accessibilityIdentifier
+              detailTextBlock:(id)detailTextBlock
+                  selectBlock:(BOOL (^)(YTSettingsCell *cell,
+                                        NSUInteger arg1))selectBlock;
 @end
 
 @interface YTSettingsViewController : UIViewController
@@ -47,6 +53,12 @@
 
 static const NSInteger TweakSection = 'ndyt';
 static NSString *const kVolumeBoostYTEnabledKey = @"VolumeBoostYTEnabled";
+static NSString *const kVolumeBoostYTPersistenceEnabledKey =
+    @"VolumeBoostYTPersistenceEnabled";
+static NSString *const kVolumeBoostYTDefaultVolumeScalarKey =
+    @"VolumeBoostYTDefaultVolumeScalar";
+static NSString *const kCustomYouTubeVolumeScalarKey =
+    @"CustomYouTubeVolumeScalar";
 
 static BOOL IsVolumeBoostYTEnabled() {
   NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
@@ -56,18 +68,32 @@ static BOOL IsVolumeBoostYTEnabled() {
   return [defaults boolForKey:kVolumeBoostYTEnabledKey];
 }
 
-// -----------------------------------------------------
-// CONFIGURATION: Set to 1 to remember volume across app restarts, 0 to reset to
-// 100% on launch.
-// -----------------------------------------------------
-#define ENABLE_VOLUME_PERSISTENCE 0
+static BOOL IsVolumePersistenceEnabled() {
+  NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+  if ([defaults objectForKey:kVolumeBoostYTPersistenceEnabledKey] == nil) {
+    return YES; // Default to remembering the last chosen boost
+  }
+  return [defaults boolForKey:kVolumeBoostYTPersistenceEnabledKey];
+}
 
-#if ENABLE_VOLUME_PERSISTENCE
-static NSString *const kCustomYouTubeVolumeScalarKey =
-    @"CustomYouTubeVolumeScalar";
-#else
-static float currentVolumeMultiplier = 1.0f;
-#endif
+static float GetConfiguredDefaultVolumeMultiplier() {
+  NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+  if ([defaults objectForKey:kVolumeBoostYTDefaultVolumeScalarKey] == nil) {
+    return 1.0f; // Default to 100%
+  }
+  float multiplier = [defaults floatForKey:kVolumeBoostYTDefaultVolumeScalarKey];
+  if (multiplier < 0.0f)
+    multiplier = 0.0f;
+  if (multiplier > 20.0f)
+    multiplier = 20.0f;
+  return multiplier;
+}
+
+static NSString *FormattedVolumePercentage(float multiplier) {
+  return [NSString stringWithFormat:@"%.0f%%", multiplier * 100.0f];
+}
+
+static float currentVolumeMultiplier = -1.0f;
 
 static NSHashTable *activeRenderers = nil;
 
@@ -82,15 +108,18 @@ static void RegisterRenderer(id renderer) {
 
 // Helper to get current volume multiplier
 static float GetCustomVolumeMultiplier() {
-#if ENABLE_VOLUME_PERSISTENCE
   NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-  if ([defaults objectForKey:kCustomYouTubeVolumeScalarKey] == nil) {
-    return 1.0f; // Default to 100% volume
+  if (IsVolumePersistenceEnabled()) {
+    if ([defaults objectForKey:kCustomYouTubeVolumeScalarKey] == nil) {
+      return GetConfiguredDefaultVolumeMultiplier();
+    }
+    return [defaults floatForKey:kCustomYouTubeVolumeScalarKey];
   }
-  return [defaults floatForKey:kCustomYouTubeVolumeScalarKey];
-#else
+
+  if (currentVolumeMultiplier < 0.0f) {
+    currentVolumeMultiplier = GetConfiguredDefaultVolumeMultiplier();
+  }
   return currentVolumeMultiplier;
-#endif
 }
 
 static float GetLogarithmicAudioMultiplier() {
@@ -120,16 +149,43 @@ static void SetCustomVolumeMultiplier(float multiplier) {
   if (multiplier > 20.0f)
     multiplier = 20.0f;
 
-#if ENABLE_VOLUME_PERSISTENCE
-  [[NSUserDefaults standardUserDefaults]
-      setFloat:multiplier
-        forKey:kCustomYouTubeVolumeScalarKey];
-  [[NSUserDefaults standardUserDefaults] synchronize];
-#else
-  currentVolumeMultiplier = multiplier;
-#endif
+  if (IsVolumePersistenceEnabled()) {
+    [[NSUserDefaults standardUserDefaults]
+        setFloat:multiplier
+          forKey:kCustomYouTubeVolumeScalarKey];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+  } else {
+    currentVolumeMultiplier = multiplier;
+  }
 
   NotifyVolumeChange();
+}
+
+static void SetConfiguredDefaultVolumeMultiplier(float multiplier) {
+  if (multiplier < 0.0f)
+    multiplier = 0.0f;
+  if (multiplier > 20.0f)
+    multiplier = 20.0f;
+
+  NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+  [defaults setFloat:multiplier forKey:kVolumeBoostYTDefaultVolumeScalarKey];
+
+  if (IsVolumePersistenceEnabled()) {
+    [defaults setFloat:multiplier forKey:kCustomYouTubeVolumeScalarKey];
+  } else {
+    currentVolumeMultiplier = multiplier;
+  }
+
+  [defaults synchronize];
+  NotifyVolumeChange();
+}
+
+static UIViewController *TopViewController(UIViewController *viewController) {
+  UIViewController *top = viewController;
+  while (top.presentedViewController) {
+    top = top.presentedViewController;
+  }
+  return top;
 }
 
 // -----------------------------------------------------
@@ -320,31 +376,29 @@ static CGPoint initialTouchPoint;
 
         %hook YTSettingsGroupData
 
-    - (NSArray<NSNumber *> *)orderedCategories {
+- (NSArray<NSNumber *> *)orderedCategories {
   // Only inject into the main settings group (type 1)
   if (self.type != 1)
     return %orig;
 
   // If another tweak (YouGroupSettings) handles grouping, let it do so
-  if (class_getClassMethod(objc_getClass("YTSettingsGroupData"),
-                           @selector(tweaks))) {
-    return %orig;
+  Class settingsGroupDataClass = objc_getClass("YTSettingsGroupData");
+  if (class_getClassMethod(settingsGroupDataClass, @selector(tweaks)) &&
+      [settingsGroupDataClass respondsToSelector:@selector(tweaks)]) {
+    NSArray<NSNumber *> *tweaks =
+        [settingsGroupDataClass performSelector:@selector(tweaks)];
+    if ([tweaks containsObject:@(TweakSection)]) {
+      return %orig;
+    }
   }
 
   NSMutableArray *mutableCategories = %orig.mutableCopy;
-  if (mutableCategories) {
+  if (mutableCategories &&
+      ![mutableCategories containsObject:@(TweakSection)]) {
     // Insert our tweak section near the top
     [mutableCategories insertObject:@(TweakSection) atIndex:0];
   }
   return mutableCategories.copy ?: %orig;
-}
-
-+ (NSMutableArray<NSNumber *> *)tweaks {
-  NSMutableArray<NSNumber *> *tweaks = %orig;
-  if (tweaks && ![tweaks containsObject:@(TweakSection)]) {
-    [tweaks addObject:@(TweakSection)];
-  }
-  return tweaks;
 }
 
 %end
@@ -392,16 +446,119 @@ static CGPoint initialTouchPoint;
                          forKey:kVolumeBoostYTEnabledKey];
                     [[NSUserDefaults standardUserDefaults] synchronize];
 
-                    // Re-fire volume to normalize or amplify existing active
-                    // players immediately
-                    if (!enabled) {
-                      SetCustomVolumeMultiplier(1.0f);
-                    }
                     NotifyVolumeChange();
                     return YES;
                   }
                 settingItemId:0];
   [sectionItems addObject:enableTweak];
+
+  YTSettingsSectionItem *rememberBoost = [YTSettingsSectionItemClass
+          switchItemWithTitle:@"Remember boost"
+             titleDescription:
+                 @"When enabled, gesture changes become the new default after restart"
+      accessibilityIdentifier:nil
+                     switchOn:IsVolumePersistenceEnabled()
+                  switchBlock:^BOOL(YTSettingsCell *cell, BOOL enabled) {
+                    NSUserDefaults *defaults =
+                        [NSUserDefaults standardUserDefaults];
+                    float currentMultiplier = GetCustomVolumeMultiplier();
+                    [defaults setBool:enabled
+                               forKey:kVolumeBoostYTPersistenceEnabledKey];
+
+                    if (enabled) {
+                      [defaults setFloat:currentMultiplier
+                                  forKey:kCustomYouTubeVolumeScalarKey];
+                    } else {
+                      [defaults removeObjectForKey:kCustomYouTubeVolumeScalarKey];
+                      currentVolumeMultiplier = currentMultiplier;
+                    }
+
+                    [defaults synchronize];
+                    NotifyVolumeChange();
+                    return YES;
+                  }
+                settingItemId:1];
+  [sectionItems addObject:rememberBoost];
+
+  NSString *defaultBoostDescription =
+      @"Tap to choose the startup boost for all videos";
+
+  YTSettingsSectionItem *defaultBoostEditor = [YTSettingsSectionItemClass
+          itemWithTitle:@"Default boost"
+             titleDescription:defaultBoostDescription
+      accessibilityIdentifier:nil
+              detailTextBlock:^NSString * {
+                return FormattedVolumePercentage(
+                    GetConfiguredDefaultVolumeMultiplier());
+              }
+                  selectBlock:^BOOL(YTSettingsCell *cell, NSUInteger arg1) {
+                    UIAlertController *alert = [UIAlertController
+                        alertControllerWithTitle:@"Default boost"
+                                         message:
+                                             @"Enter the startup volume boost percentage (0-2000)."
+                                  preferredStyle:
+                                      UIAlertControllerStyleAlert];
+
+                    [alert addTextFieldWithConfigurationHandler:^(
+                               UITextField *textField) {
+                      textField.keyboardType =
+                          UIKeyboardTypeNumbersAndPunctuation;
+                      textField.placeholder = @"100";
+                      textField.text = [NSString
+                          stringWithFormat:@"%.0f",
+                                           GetConfiguredDefaultVolumeMultiplier() *
+                                               100.0f];
+                    }];
+
+                    [alert
+                        addAction:[UIAlertAction actionWithTitle:@"Cancel"
+                                                          style:UIAlertActionStyleCancel
+                                                        handler:nil]];
+
+                    __weak typeof(self) weakSelf = self;
+                    [alert addAction:[UIAlertAction
+                                         actionWithTitle:@"Save"
+                                                   style:UIAlertActionStyleDefault
+                                                 handler:^(
+                                                     UIAlertAction *action) {
+                                                   UITextField *textField =
+                                                       alert.textFields
+                                                           .firstObject;
+                                                   float percentage =
+                                                       [textField.text floatValue];
+                                                   if (percentage < 0.0f)
+                                                     percentage = 0.0f;
+                                                   if (percentage > 2000.0f)
+                                                     percentage = 2000.0f;
+
+                                                   SetConfiguredDefaultVolumeMultiplier(
+                                                       percentage / 100.0f);
+
+                                                   if (weakSelf) {
+                                                     [weakSelf
+                                                         updateVolumeBoostYTSectionWithEntry:
+                                                             entry];
+                                                   }
+                                                 }]];
+
+                    UIViewController *presentingController =
+                        TopViewController(settingsViewController);
+                    if (!presentingController && cell.window) {
+                      presentingController =
+                          TopViewController(cell.window.rootViewController);
+                    }
+
+                    if (!presentingController) {
+                      return NO;
+                    }
+
+                    [presentingController presentViewController:alert
+                                                       animated:YES
+                                                     completion:nil];
+                    return YES;
+                  }
+                ];
+  [sectionItems addObject:defaultBoostEditor];
 
   if ([settingsViewController
           respondsToSelector:@selector
@@ -437,19 +594,37 @@ static CGPoint initialTouchPoint;
 
     %end // end group YouTubeSettings
 
-    %ctor {
+static BOOL IsYouTubeProcess() {
+  return NSClassFromString(@"YTSettingsGroupData") != nil ||
+         NSClassFromString(@"YTPlayerViewController") != nil;
+}
+
+static BOOL HasYouTubeSettingsClasses() {
+  return NSClassFromString(@"YTSettingsGroupData") != nil &&
+         NSClassFromString(@"YTAppSettingsPresentationData") != nil &&
+         NSClassFromString(@"YTSettingsSectionItemManager") != nil &&
+         NSClassFromString(@"YTSettingsSectionItem") != nil;
+}
+
+%ctor {
   // Never inject into SpringBoard (Home Screen)
   NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier];
   if ([bundleID isEqualToString:@"com.apple.springboard"]) {
     return;
   }
 
-  // Check if YouTube classes exist instead of relying on Bundle ID,
-  // because sideloaded apps (like LiveContainer) often change their Bundle IDs.
-  if (NSClassFromString(@"YTSettingsGroupData")) {
+  // Only initialize inside a YouTube process. Sideloaded builds may use
+  // different bundle identifiers, so class presence is safer than bundle ID.
+  if (!IsYouTubeProcess()) {
+    return;
+  }
+
+  // Settings integration is optional and should only load when the full set of
+  // expected YouTube settings classes is available.
+  if (HasYouTubeSettingsClasses()) {
     %init(YouTubeSettings);
   }
 
-  // Always initialize the core AVPlayer and UIWindow touch hooks for every app
+  // Core player and gesture hooks are only intended for YouTube itself.
   %init;
 }
