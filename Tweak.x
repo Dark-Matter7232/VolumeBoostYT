@@ -4,6 +4,8 @@
 #import <AudioToolbox/AudioToolbox.h>
 #import <MediaToolbox/MediaToolbox.h>
 #import <UIKit/UIKit.h>
+#import <math.h>
+#import <string.h>
 #import <objc/runtime.h>
 
 // YouTube Settings Headers
@@ -57,10 +59,18 @@ static const NSInteger TweakSection = 'ndyt';
 static NSString *const kVolumeBoostYTEnabledKey = @"VolumeBoostYTEnabled";
 static NSString *const kVolumeBoostYTPersistenceEnabledKey =
     @"VolumeBoostYTPersistenceEnabled";
+static NSString *const kVolumeBoostYTFallbackEnabledKey =
+    @"VolumeBoostYTFallbackEnabled";
 static NSString *const kVolumeBoostYTDefaultVolumeScalarKey =
     @"VolumeBoostYTDefaultVolumeScalar";
 static NSString *const kCustomYouTubeVolumeScalarKey =
     @"CustomYouTubeVolumeScalar";
+static NSString *const kVolumeBoostYTBassAmountKey =
+    @"VolumeBoostYTBassAmount";
+static NSString *const kVolumeBoostYTLoudnessAmountKey =
+    @"VolumeBoostYTLoudnessAmount";
+static NSString *const kVolumeBoostYTClarityAmountKey =
+    @"VolumeBoostYTClarityAmount";
 static const void *kVolumeBoostYTTapInstalledKey =
     &kVolumeBoostYTTapInstalledKey;
 
@@ -80,8 +90,21 @@ static BOOL IsVolumePersistenceEnabled() {
   return [defaults boolForKey:kVolumeBoostYTPersistenceEnabledKey];
 }
 
+static BOOL IsFallbackBoostEnabled() {
+  NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+  if ([defaults objectForKey:kVolumeBoostYTFallbackEnabledKey] == nil) {
+    return YES; // Default to keeping the safety-net fallback enabled
+  }
+  return [defaults boolForKey:kVolumeBoostYTFallbackEnabledKey];
+}
+
 static float ClampVolumeMultiplier(float multiplier);
 static float GetLogarithmicAudioMultiplier(void);
+static float ClampUnitInterval(float value);
+static float GetBassAmount(void);
+static float GetLoudnessAmount(void);
+static float GetClarityAmount(void);
+static void NotifyVolumeChange(void);
 
 static float GetConfiguredDefaultVolumeMultiplier() {
   NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
@@ -96,12 +119,51 @@ static NSString *FormattedVolumePercentage(float multiplier) {
   return [NSString stringWithFormat:@"%.0f%%", multiplier * 100.0f];
 }
 
+static NSString *FormattedEffectPercentage(float amount) {
+  return [NSString stringWithFormat:@"%.0f%%", amount * 100.0f];
+}
+
 static float ClampVolumeMultiplier(float multiplier) {
   if (multiplier < 0.0f)
     return 0.0f;
   if (multiplier > 20.0f)
     return 20.0f;
   return multiplier;
+}
+
+static float ClampUnitInterval(float value) {
+  if (value < 0.0f)
+    return 0.0f;
+  if (value > 1.0f)
+    return 1.0f;
+  return value;
+}
+
+static float GetEffectAmountForKey(NSString *key, float defaultValue) {
+  NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+  if ([defaults objectForKey:key] == nil) {
+    return defaultValue;
+  }
+  return ClampUnitInterval([defaults floatForKey:key]);
+}
+
+static void SetEffectAmountForKey(NSString *key, float amount) {
+  [[NSUserDefaults standardUserDefaults] setFloat:ClampUnitInterval(amount)
+                                           forKey:key];
+  [[NSUserDefaults standardUserDefaults] synchronize];
+  NotifyVolumeChange();
+}
+
+static float GetBassAmount(void) {
+  return GetEffectAmountForKey(kVolumeBoostYTBassAmountKey, 0.6f);
+}
+
+static float GetLoudnessAmount(void) {
+  return GetEffectAmountForKey(kVolumeBoostYTLoudnessAmountKey, 0.65f);
+}
+
+static float GetClarityAmount(void) {
+  return GetEffectAmountForKey(kVolumeBoostYTClarityAmountKey, 0.45f);
 }
 
 static float currentVolumeMultiplier = -1.0f;
@@ -114,6 +176,18 @@ typedef struct {
   Float32 envelope;
   Float32 *scratchBuffer;
   UInt32 scratchCapacity;
+  Float32 *bassState;
+  UInt32 bassStateChannelCount;
+  Float32 *compressorState;
+  UInt32 compressorStateChannelCount;
+  Float32 *presenceState;
+  UInt32 presenceStateChannelCount;
+  Float32 *limiterEnvelopeState;
+  UInt32 limiterEnvelopeChannelCount;
+  Float32 *limiterDelayBuffer;
+  UInt32 limiterDelayCapacity;
+  UInt32 limiterDelaySamples;
+  UInt32 limiterWriteIndex;
 } VolumeBoostYTTapContext;
 
 static void RegisterRenderer(id renderer) {
@@ -139,11 +213,316 @@ static void VolumeBoostYTTapFinalize(MTAudioProcessingTapRef tap) {
   VolumeBoostYTTapContext *context =
       MTAudioProcessingTapGetStorage(tap);
   if (context) {
+    if (context->limiterDelayBuffer) {
+      free(context->limiterDelayBuffer);
+    }
+    if (context->limiterEnvelopeState) {
+      free(context->limiterEnvelopeState);
+    }
+    if (context->presenceState) {
+      free(context->presenceState);
+    }
+    if (context->compressorState) {
+      free(context->compressorState);
+    }
+    if (context->bassState) {
+      free(context->bassState);
+    }
     if (context->scratchBuffer) {
       free(context->scratchBuffer);
     }
     free(context);
   }
+}
+
+static void EnsureBassStateCapacity(VolumeBoostYTTapContext *context,
+                                    UInt32 channelCount) {
+  if (!context || channelCount == 0 ||
+      channelCount <= context->bassStateChannelCount) {
+    return;
+  }
+
+  Float32 *newState =
+      realloc(context->bassState, channelCount * sizeof(Float32));
+  if (!newState) {
+    return;
+  }
+
+  for (UInt32 index = context->bassStateChannelCount; index < channelCount;
+       index++) {
+    newState[index] = 0.0f;
+  }
+
+  context->bassState = newState;
+  context->bassStateChannelCount = channelCount;
+}
+
+static void EnsureCompressorStateCapacity(VolumeBoostYTTapContext *context,
+                                          UInt32 channelCount) {
+  if (!context || channelCount == 0 ||
+      channelCount <= context->compressorStateChannelCount) {
+    return;
+  }
+
+  Float32 *newState =
+      realloc(context->compressorState, channelCount * sizeof(Float32));
+  if (!newState) {
+    return;
+  }
+
+  for (UInt32 index = context->compressorStateChannelCount;
+       index < channelCount; index++) {
+    newState[index] = 0.0f;
+  }
+
+  context->compressorState = newState;
+  context->compressorStateChannelCount = channelCount;
+}
+
+static void EnsurePresenceStateCapacity(VolumeBoostYTTapContext *context,
+                                        UInt32 channelCount) {
+  if (!context || channelCount == 0 ||
+      channelCount <= context->presenceStateChannelCount) {
+    return;
+  }
+
+  Float32 *newState =
+      realloc(context->presenceState, channelCount * sizeof(Float32));
+  if (!newState) {
+    return;
+  }
+
+  for (UInt32 index = context->presenceStateChannelCount; index < channelCount;
+       index++) {
+    newState[index] = 0.0f;
+  }
+
+  context->presenceState = newState;
+  context->presenceStateChannelCount = channelCount;
+}
+
+static void EnsureLimiterStateCapacity(VolumeBoostYTTapContext *context,
+                                       UInt32 channelCount,
+                                       UInt32 delaySamples) {
+  if (!context || channelCount == 0 || delaySamples == 0) {
+    return;
+  }
+
+  if (channelCount > context->limiterEnvelopeChannelCount) {
+    Float32 *newEnvelope =
+        realloc(context->limiterEnvelopeState, channelCount * sizeof(Float32));
+    if (newEnvelope) {
+      for (UInt32 index = context->limiterEnvelopeChannelCount;
+           index < channelCount; index++) {
+        newEnvelope[index] = 1.0f;
+      }
+      context->limiterEnvelopeState = newEnvelope;
+      context->limiterEnvelopeChannelCount = channelCount;
+    }
+  }
+
+  UInt32 requiredCapacity = channelCount * delaySamples;
+  if (requiredCapacity > context->limiterDelayCapacity) {
+    Float32 *newDelayBuffer =
+        realloc(context->limiterDelayBuffer, requiredCapacity * sizeof(Float32));
+    if (newDelayBuffer) {
+      for (UInt32 index = context->limiterDelayCapacity; index < requiredCapacity;
+           index++) {
+        newDelayBuffer[index] = 0.0f;
+      }
+      context->limiterDelayBuffer = newDelayBuffer;
+      context->limiterDelayCapacity = requiredCapacity;
+    }
+  }
+
+  if (context->limiterDelaySamples != delaySamples) {
+    context->limiterDelaySamples = delaySamples;
+    context->limiterWriteIndex = 0;
+    if (context->limiterDelayBuffer) {
+      memset(context->limiterDelayBuffer, 0,
+             context->limiterDelayCapacity * sizeof(Float32));
+    }
+    if (context->limiterEnvelopeState) {
+      for (UInt32 index = 0; index < context->limiterEnvelopeChannelCount;
+           index++) {
+        context->limiterEnvelopeState[index] = 1.0f;
+      }
+    }
+  }
+}
+
+static void ApplyBassEnhancement(Float32 *samples, UInt32 sampleCount,
+                                 UInt32 channelCount, Float64 sampleRate,
+                                 Float32 *channelState) {
+  if (!samples || sampleCount == 0 || channelCount == 0 || !channelState ||
+      sampleRate <= 0.0) {
+    return;
+  }
+
+  Float32 bassAmount = GetBassAmount();
+  if (bassAmount <= 0.001f) {
+    return;
+  }
+
+  const Float32 bassCutoffHz = 180.0f;
+  const Float32 bassMix = 0.05f + 0.25f * bassAmount;
+  const Float32 bassClamp = 0.35f;
+  Float32 smoothing =
+      expf((Float32)(-2.0 * M_PI * bassCutoffHz / sampleRate));
+  smoothing = fminf(fmaxf(smoothing, 0.0f), 0.995f);
+  Float32 follow = 1.0f - smoothing;
+
+  for (UInt32 frameIndex = 0; frameIndex < sampleCount; frameIndex += channelCount) {
+    for (UInt32 channelIndex = 0; channelIndex < channelCount; channelIndex++) {
+      UInt32 sampleIndex = frameIndex + channelIndex;
+      Float32 lowBand = channelState[channelIndex] +
+                        follow * (samples[sampleIndex] - channelState[channelIndex]);
+      channelState[channelIndex] = lowBand;
+      Float32 boosted = samples[sampleIndex] + lowBand * bassMix;
+      samples[sampleIndex] = fminf(fmaxf(boosted, -1.0f - bassClamp),
+                                   1.0f + bassClamp);
+    }
+  }
+}
+
+static void ApplyLoudnessCompressor(Float32 *samples, UInt32 sampleCount,
+                                    UInt32 channelCount, Float64 sampleRate,
+                                    Float32 *channelState) {
+  if (!samples || sampleCount == 0 || channelCount == 0 || !channelState ||
+      sampleRate <= 0.0) {
+    return;
+  }
+
+  Float32 loudnessAmount = GetLoudnessAmount();
+  if (loudnessAmount <= 0.001f) {
+    return;
+  }
+
+  const Float32 threshold = 0.72f - 0.28f * loudnessAmount;
+  const Float32 ratio = 1.4f + 2.8f * loudnessAmount;
+  const Float32 makeupGain = 1.0f + 0.28f * loudnessAmount;
+  const Float32 attackMs = 8.0f;
+  const Float32 releaseMs = 140.0f;
+  const Float32 attack =
+      expf(-1.0f / (Float32)(sampleRate * attackMs * 0.001f));
+  const Float32 release =
+      expf(-1.0f / (Float32)(sampleRate * releaseMs * 0.001f));
+
+  for (UInt32 frameIndex = 0; frameIndex < sampleCount;
+       frameIndex += channelCount) {
+    for (UInt32 channelIndex = 0; channelIndex < channelCount; channelIndex++) {
+      UInt32 sampleIndex = frameIndex + channelIndex;
+      Float32 sample = samples[sampleIndex];
+      Float32 level = fabsf(sample);
+      Float32 detector = channelState[channelIndex];
+
+      if (level > detector) {
+        detector = attack * detector + (1.0f - attack) * level;
+      } else {
+        detector = release * detector + (1.0f - release) * level;
+      }
+      channelState[channelIndex] = detector;
+
+      Float32 gain = makeupGain;
+      if (detector > threshold) {
+        Float32 compressedLevel =
+            threshold + (detector - threshold) / ratio;
+        gain *= compressedLevel / detector;
+      }
+
+      samples[sampleIndex] = sample * gain;
+    }
+  }
+}
+
+static void ApplyPresenceEnhancement(Float32 *samples, UInt32 sampleCount,
+                                     UInt32 channelCount, Float64 sampleRate,
+                                     Float32 *channelState) {
+  if (!samples || sampleCount == 0 || channelCount == 0 || !channelState ||
+      sampleRate <= 0.0) {
+    return;
+  }
+
+  Float32 clarityAmount = GetClarityAmount();
+  if (clarityAmount <= 0.001f) {
+    return;
+  }
+
+  const Float32 presenceCutoffHz = 1800.0f;
+  const Float32 presenceMix = 0.32f * clarityAmount;
+  Float32 smoothing =
+      expf((Float32)(-2.0 * M_PI * presenceCutoffHz / sampleRate));
+  smoothing = fminf(fmaxf(smoothing, 0.0f), 0.999f);
+  Float32 follow = 1.0f - smoothing;
+
+  for (UInt32 frameIndex = 0; frameIndex < sampleCount;
+       frameIndex += channelCount) {
+    for (UInt32 channelIndex = 0; channelIndex < channelCount; channelIndex++) {
+      UInt32 sampleIndex = frameIndex + channelIndex;
+      Float32 lowBand = channelState[channelIndex] +
+                        follow *
+                            (samples[sampleIndex] - channelState[channelIndex]);
+      channelState[channelIndex] = lowBand;
+      Float32 highBand = samples[sampleIndex] - lowBand;
+      samples[sampleIndex] += highBand * presenceMix;
+    }
+  }
+}
+
+static void ApplyLookaheadLimiter(Float32 *samples, UInt32 sampleCount,
+                                  UInt32 channelCount,
+                                  UInt32 channelOffset,
+                                  VolumeBoostYTTapContext *context) {
+  if (!samples || sampleCount == 0 || channelCount == 0 || !context ||
+      !context->limiterEnvelopeState || !context->limiterDelayBuffer ||
+      context->limiterDelaySamples == 0) {
+    return;
+  }
+
+  const Float32 ceiling = 0.96f;
+  const Float32 releaseMs = 85.0f;
+  Float64 sampleRate = context->format.mSampleRate;
+  if (sampleRate <= 0.0) {
+    return;
+  }
+
+  Float32 release =
+      expf(-1.0f / (Float32)(sampleRate * releaseMs * 0.001f));
+  UInt32 delaySamples = context->limiterDelaySamples;
+  UInt32 writeIndex = context->limiterWriteIndex;
+
+  for (UInt32 frameIndex = 0; frameIndex < sampleCount;
+       frameIndex += channelCount) {
+    for (UInt32 channelIndex = 0; channelIndex < channelCount; channelIndex++) {
+      UInt32 sampleIndex = frameIndex + channelIndex;
+      UInt32 stateChannelIndex = channelOffset + channelIndex;
+      UInt32 delayIndex = stateChannelIndex * delaySamples + writeIndex;
+      Float32 delayedSample = context->limiterDelayBuffer[delayIndex];
+      context->limiterDelayBuffer[delayIndex] = samples[sampleIndex];
+
+      Float32 targetGain = 1.0f;
+      Float32 level = fabsf(samples[sampleIndex]);
+      if (level > ceiling) {
+        targetGain = ceiling / level;
+      }
+
+      Float32 envelope = context->limiterEnvelopeState[stateChannelIndex];
+      if (targetGain < envelope) {
+        envelope = targetGain;
+      } else {
+        envelope = release * envelope + (1.0f - release) * targetGain;
+      }
+      context->limiterEnvelopeState[stateChannelIndex] = envelope;
+      samples[sampleIndex] = delayedSample * envelope;
+    }
+
+    writeIndex++;
+    if (writeIndex >= delaySamples) {
+      writeIndex = 0;
+    }
+  }
+
+  context->limiterWriteIndex = writeIndex;
 }
 
 static void VolumeBoostYTTapPrepare(MTAudioProcessingTapRef tap,
@@ -156,6 +535,12 @@ static void VolumeBoostYTTapPrepare(MTAudioProcessingTapRef tap,
     context->format = *processingFormat;
     context->envelope = 1.0f;
     UInt32 channels = MAX((UInt32)processingFormat->mChannelsPerFrame, 1U);
+    UInt32 lookaheadSamples =
+        (UInt32)fmin(fmax(processingFormat->mSampleRate * 0.003, 32.0), 256.0);
+    EnsureBassStateCapacity(context, channels);
+    EnsureCompressorStateCapacity(context, channels);
+    EnsurePresenceStateCapacity(context, channels);
+    EnsureLimiterStateCapacity(context, channels, lookaheadSamples);
     UInt32 neededCapacity = (UInt32)maxFrames * channels;
     if (neededCapacity > context->scratchCapacity) {
       Float32 *newBuffer =
@@ -204,6 +589,8 @@ static void VolumeBoostYTTapProcess(MTAudioProcessingTapRef tap,
   const Float32 release = 0.003f;
   const Float32 drive = 1.5f;
   const Float32 tanhNormalization = tanhf(drive);
+  const BOOL isNonInterleaved =
+      (format->mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0;
   Float32 peak = 0.0f;
   UInt32 totalSampleCount = 0;
 
@@ -245,6 +632,7 @@ static void VolumeBoostYTTapProcess(MTAudioProcessingTapRef tap,
 
   Float32 rampGain = context->envelope;
   Float32 gainStep = (envelope - context->envelope) / totalSampleCount;
+  UInt32 channelCursor = 0;
 
   for (UInt32 bufferIndex = 0; bufferIndex < bufferListInOut->mNumberBuffers;
        bufferIndex++) {
@@ -260,11 +648,41 @@ static void VolumeBoostYTTapProcess(MTAudioProcessingTapRef tap,
     }
 
     vDSP_vrampmul(samples, 1, &rampGain, &gainStep, samples, 1, sampleCount);
+    UInt32 bufferChannelCount = MAX(buffer.mNumberChannels, 1U);
+    if (!isNonInterleaved) {
+      bufferChannelCount = MAX((UInt32)format->mChannelsPerFrame, 1U);
+    }
+    EnsureBassStateCapacity(context, channelCursor + bufferChannelCount);
+    EnsureCompressorStateCapacity(context, channelCursor + bufferChannelCount);
+    EnsurePresenceStateCapacity(context, channelCursor + bufferChannelCount);
+    if (context->bassState && channelCursor + bufferChannelCount <=
+                                  context->bassStateChannelCount) {
+      ApplyBassEnhancement(samples, sampleCount, bufferChannelCount,
+                           format->mSampleRate,
+                           context->bassState + channelCursor);
+    }
+    if (context->compressorState &&
+        channelCursor + bufferChannelCount <=
+            context->compressorStateChannelCount) {
+      ApplyLoudnessCompressor(samples, sampleCount, bufferChannelCount,
+                              format->mSampleRate,
+                              context->compressorState + channelCursor);
+    }
+    if (context->presenceState &&
+        channelCursor + bufferChannelCount <=
+            context->presenceStateChannelCount) {
+      ApplyPresenceEnhancement(samples, sampleCount, bufferChannelCount,
+                               format->mSampleRate,
+                               context->presenceState + channelCursor);
+    }
+    ApplyLookaheadLimiter(samples, sampleCount, bufferChannelCount,
+                          channelCursor, context);
     vDSP_vsmul(samples, 1, &drive, context->scratchBuffer, 1, sampleCount);
     int sampleCountInt = (int)sampleCount;
     vvtanhf(context->scratchBuffer, context->scratchBuffer, &sampleCountInt);
     vDSP_vsdiv(context->scratchBuffer, 1, &tanhNormalization, samples, 1,
                sampleCount);
+    channelCursor += bufferChannelCount;
   }
 
   context->envelope = envelope;
@@ -291,8 +709,6 @@ static float GetLogarithmicAudioMultiplier() {
   if (m <= 1.0f) {
     return m;
   }
-  // This is the fallback curve for players that cannot use our sample tap.
-  // Keep it conservative so non-tap playback still sounds reasonably smooth.
   static const float kMaxSafeAudioGain = 4.0f;
   float normalized = (m - 1.0f) / 19.0f;
   float eased = 1.0f - powf(1.0f - normalized, 2.0f);
@@ -430,9 +846,8 @@ static UIViewController *TopViewController(UIViewController *viewController) {
       !HasVolumeBoostYTTap(currentItem)) {
     InstallVolumeBoostYTTapOnPlayerItem(currentItem);
   }
-  if (IsVolumeBoostYTEnabled() &&
-      !HasVolumeBoostYTTap(currentItem)) {
-    volume = volume * GetLogarithmicAudioMultiplier();
+  if (IsVolumeBoostYTEnabled()) {
+    volume = 1.0f;
   }
   %orig(volume);
 }
@@ -460,7 +875,7 @@ static UIViewController *TopViewController(UIViewController *viewController) {
 }
 - (void)setVolume:(float)volume {
   RegisterRenderer(self);
-  if (IsVolumeBoostYTEnabled()) {
+  if (IsVolumeBoostYTEnabled() && IsFallbackBoostEnabled()) {
     volume = volume * GetLogarithmicAudioMultiplier();
   }
   %orig(volume);
@@ -480,7 +895,7 @@ static UIViewController *TopViewController(UIViewController *viewController) {
 }
 - (void)setVolume:(float)volume {
   RegisterRenderer(self);
-  if (IsVolumeBoostYTEnabled()) {
+  if (IsVolumeBoostYTEnabled() && IsFallbackBoostEnabled()) {
     volume = volume * GetLogarithmicAudioMultiplier();
   }
   %orig(volume);
@@ -495,7 +910,7 @@ static UIViewController *TopViewController(UIViewController *viewController) {
 }
 - (void)setVolume:(float)volume {
   RegisterRenderer(self);
-  if (IsVolumeBoostYTEnabled()) {
+  if (IsVolumeBoostYTEnabled() && IsFallbackBoostEnabled()) {
     volume = volume * GetLogarithmicAudioMultiplier();
   }
   %orig(volume);
@@ -721,6 +1136,24 @@ static CGPoint initialTouchPoint;
                 settingItemId:1];
   [sectionItems addObject:rememberBoost];
 
+  YTSettingsSectionItem *fallbackBoost = [YTSettingsSectionItemClass
+          switchItemWithTitle:@"Fallback boost"
+             titleDescription:
+                 @"Keep emergency volume scaling enabled for non-AVPlayer playback paths"
+      accessibilityIdentifier:nil
+                     switchOn:IsFallbackBoostEnabled()
+                  switchBlock:^BOOL(YTSettingsCell *cell, BOOL enabled) {
+                    [[NSUserDefaults standardUserDefaults]
+                        setBool:enabled
+                         forKey:kVolumeBoostYTFallbackEnabledKey];
+                    [[NSUserDefaults standardUserDefaults] synchronize];
+
+                    NotifyVolumeChange();
+                    return YES;
+                  }
+                settingItemId:2];
+  [sectionItems addObject:fallbackBoost];
+
   NSString *defaultBoostDescription =
       @"Tap to choose the startup boost for all videos";
 
@@ -800,6 +1233,230 @@ static CGPoint initialTouchPoint;
                   }
                 ];
   [sectionItems addObject:defaultBoostEditor];
+
+  YTSettingsSectionItem *bassEditor = [YTSettingsSectionItemClass
+          itemWithTitle:@"Bass"
+             titleDescription:@"Adjust low-end emphasis in the tap-based DSP chain"
+      accessibilityIdentifier:nil
+              detailTextBlock:^NSString * {
+                return FormattedEffectPercentage(GetBassAmount());
+              }
+                  selectBlock:^BOOL(YTSettingsCell *cell, NSUInteger arg1) {
+                    UIAlertController *alert = [UIAlertController
+                        alertControllerWithTitle:@"Bass"
+                                         message:@"Enter bass strength (0-100)."
+                                  preferredStyle:UIAlertControllerStyleAlert];
+
+                    [alert addTextFieldWithConfigurationHandler:^(
+                               UITextField *textField) {
+                      textField.keyboardType =
+                          UIKeyboardTypeNumbersAndPunctuation;
+                      textField.placeholder = @"60";
+                      textField.text =
+                          [NSString stringWithFormat:@"%.0f",
+                                                     GetBassAmount() * 100.0f];
+                    }];
+
+                    [alert
+                        addAction:[UIAlertAction actionWithTitle:@"Cancel"
+                                                          style:UIAlertActionStyleCancel
+                                                        handler:nil]];
+
+                    __weak typeof(self) weakSelf = self;
+                    [alert addAction:[UIAlertAction
+                                         actionWithTitle:@"Save"
+                                                   style:UIAlertActionStyleDefault
+                                                 handler:^(
+                                                     UIAlertAction *action) {
+                                                   UITextField *textField =
+                                                       alert.textFields
+                                                           .firstObject;
+                                                   float percentage =
+                                                       [textField.text floatValue];
+                                                   if (percentage < 0.0f)
+                                                     percentage = 0.0f;
+                                                   if (percentage > 100.0f)
+                                                     percentage = 100.0f;
+
+                                                   SetEffectAmountForKey(
+                                                       kVolumeBoostYTBassAmountKey,
+                                                       percentage / 100.0f);
+
+                                                   if (weakSelf) {
+                                                     [weakSelf
+                                                         updateVolumeBoostYTSectionWithEntry:
+                                                             entry];
+                                                   }
+                                                 }]];
+
+                    UIViewController *presentingController =
+                        TopViewController(settingsViewController);
+                    if (!presentingController && cell.window) {
+                      presentingController =
+                          TopViewController(cell.window.rootViewController);
+                    }
+
+                    if (!presentingController) {
+                      return NO;
+                    }
+
+                    [presentingController presentViewController:alert
+                                                       animated:YES
+                                                     completion:nil];
+                    return YES;
+                  }
+                ];
+  [sectionItems addObject:bassEditor];
+
+  YTSettingsSectionItem *loudnessEditor = [YTSettingsSectionItemClass
+          itemWithTitle:@"Loudness"
+             titleDescription:
+                 @"Adjust compression and makeup gain for perceived loudness"
+      accessibilityIdentifier:nil
+              detailTextBlock:^NSString * {
+                return FormattedEffectPercentage(GetLoudnessAmount());
+              }
+                  selectBlock:^BOOL(YTSettingsCell *cell, NSUInteger arg1) {
+                    UIAlertController *alert = [UIAlertController
+                        alertControllerWithTitle:@"Loudness"
+                                         message:
+                                             @"Enter loudness strength (0-100)."
+                                  preferredStyle:UIAlertControllerStyleAlert];
+
+                    [alert addTextFieldWithConfigurationHandler:^(
+                               UITextField *textField) {
+                      textField.keyboardType =
+                          UIKeyboardTypeNumbersAndPunctuation;
+                      textField.placeholder = @"65";
+                      textField.text = [NSString
+                          stringWithFormat:@"%.0f",
+                                           GetLoudnessAmount() * 100.0f];
+                    }];
+
+                    [alert
+                        addAction:[UIAlertAction actionWithTitle:@"Cancel"
+                                                          style:UIAlertActionStyleCancel
+                                                        handler:nil]];
+
+                    __weak typeof(self) weakSelf = self;
+                    [alert addAction:[UIAlertAction
+                                         actionWithTitle:@"Save"
+                                                   style:UIAlertActionStyleDefault
+                                                 handler:^(
+                                                     UIAlertAction *action) {
+                                                   UITextField *textField =
+                                                       alert.textFields
+                                                           .firstObject;
+                                                   float percentage =
+                                                       [textField.text floatValue];
+                                                   if (percentage < 0.0f)
+                                                     percentage = 0.0f;
+                                                   if (percentage > 100.0f)
+                                                     percentage = 100.0f;
+
+                                                   SetEffectAmountForKey(
+                                                       kVolumeBoostYTLoudnessAmountKey,
+                                                       percentage / 100.0f);
+
+                                                   if (weakSelf) {
+                                                     [weakSelf
+                                                         updateVolumeBoostYTSectionWithEntry:
+                                                             entry];
+                                                   }
+                                                 }]];
+
+                    UIViewController *presentingController =
+                        TopViewController(settingsViewController);
+                    if (!presentingController && cell.window) {
+                      presentingController =
+                          TopViewController(cell.window.rootViewController);
+                    }
+
+                    if (!presentingController) {
+                      return NO;
+                    }
+
+                    [presentingController presentViewController:alert
+                                                       animated:YES
+                                                     completion:nil];
+                    return YES;
+                  }
+                ];
+  [sectionItems addObject:loudnessEditor];
+
+  YTSettingsSectionItem *clarityEditor = [YTSettingsSectionItemClass
+          itemWithTitle:@"Clarity"
+             titleDescription:@"Adjust presence boost for speech and detail"
+      accessibilityIdentifier:nil
+              detailTextBlock:^NSString * {
+                return FormattedEffectPercentage(GetClarityAmount());
+              }
+                  selectBlock:^BOOL(YTSettingsCell *cell, NSUInteger arg1) {
+                    UIAlertController *alert = [UIAlertController
+                        alertControllerWithTitle:@"Clarity"
+                                         message:@"Enter clarity strength (0-100)."
+                                  preferredStyle:UIAlertControllerStyleAlert];
+
+                    [alert addTextFieldWithConfigurationHandler:^(
+                               UITextField *textField) {
+                      textField.keyboardType =
+                          UIKeyboardTypeNumbersAndPunctuation;
+                      textField.placeholder = @"45";
+                      textField.text = [NSString
+                          stringWithFormat:@"%.0f",
+                                           GetClarityAmount() * 100.0f];
+                    }];
+
+                    [alert
+                        addAction:[UIAlertAction actionWithTitle:@"Cancel"
+                                                          style:UIAlertActionStyleCancel
+                                                        handler:nil]];
+
+                    __weak typeof(self) weakSelf = self;
+                    [alert addAction:[UIAlertAction
+                                         actionWithTitle:@"Save"
+                                                   style:UIAlertActionStyleDefault
+                                                 handler:^(
+                                                     UIAlertAction *action) {
+                                                   UITextField *textField =
+                                                       alert.textFields
+                                                           .firstObject;
+                                                   float percentage =
+                                                       [textField.text floatValue];
+                                                   if (percentage < 0.0f)
+                                                     percentage = 0.0f;
+                                                   if (percentage > 100.0f)
+                                                     percentage = 100.0f;
+
+                                                   SetEffectAmountForKey(
+                                                       kVolumeBoostYTClarityAmountKey,
+                                                       percentage / 100.0f);
+
+                                                   if (weakSelf) {
+                                                     [weakSelf
+                                                         updateVolumeBoostYTSectionWithEntry:
+                                                             entry];
+                                                   }
+                                                 }]];
+
+                    UIViewController *presentingController =
+                        TopViewController(settingsViewController);
+                    if (!presentingController && cell.window) {
+                      presentingController =
+                          TopViewController(cell.window.rootViewController);
+                    }
+
+                    if (!presentingController) {
+                      return NO;
+                    }
+
+                    [presentingController presentViewController:alert
+                                                       animated:YES
+                                                     completion:nil];
+                    return YES;
+                  }
+                ];
+  [sectionItems addObject:clarityEditor];
 
   if ([settingsViewController
           respondsToSelector:@selector

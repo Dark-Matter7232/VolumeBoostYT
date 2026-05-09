@@ -4,11 +4,19 @@ A powerful iOS tweak that provides an independent, gesture-based volume control 
 
 ## Features
 - **Independent Audio Amplification:** Boost the YouTube internal volume up to 2000% (20x multiplier) without touching the iOS system volume, with a smoother processing path for supported AVPlayer playback.
+- **Fuller Low-End Response:** Supported AVPlayer playback now gets a subtle bass lift inside the tap-based DSP chain, so higher boost levels sound less thin and harsh.
+- **Smarter Loudness Processing:** The AVPlayer DSP chain now adds gentle compression, clarity enhancement, and lookahead limiting so boosted playback sounds louder, cleaner, and more controlled.
 - **Native Screen Edge Gesture:** Seamlessly swipe inwards from the right edge of the screen, then drag up and down to adjust the volume.
 - **HUD Indicator:** Displays a temporary visual percentage overlay so you know exactly how loud the volume is.
 - **Universal Hooking:** Instead of placing a bloated UI overlay over the screen, the tweak hooks directly into `- [UIWindow sendEvent:]` to mathematically intercept screen touches. This perfectly preserves YouTube's native fullscreen auto-rotation and layout behaviors.
-- **In-App Settings Integration:** Enable or disable the tweak natively from within the YouTube Settings menu, configure a default startup boost, and choose whether gesture changes persist across restarts.
-- **Universal Compatibility:** Works with AVPlayer, AVAudioPlayer, and modern AVSampleBufferAudioRenderer pipelines. Uses a smoother tap-based processing path for supported AVPlayer playback and includes fallback logic for unsupported playback paths and sideloading app-sandbox modifications like LiveContainer.
+- **In-App Settings Integration:** Enable or disable the tweak natively
+  from within the YouTube Settings menu, configure a default startup
+  boost, choose whether gesture changes persist across restarts, toggle
+  fallback boost behavior, and tune Bass, Loudness, and Clarity.
+- **AVPlayer-First Processing:** Supported AVPlayer playback is forced
+  through the tap-based processing chain so the richer DSP path is used
+  consistently, while an optional fallback boost keeps non-AVPlayer
+  playback paths covered.
 
 ## Tested Environments
 - **Rootless Jailbreak Targets:** Compatible with standard Theos build processes.
